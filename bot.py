@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ======= KONFIGURASI =======
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "ISI_TOKEN_BOT_TELEGRAM_KAMU")
+BOT_TOKEN = os.getenv("7577154345", "8566241367:AAFXPaMhnL_KANFA1dVGIqI00NgZMG_yqVA")
 CHECK_INTERVAL = 600  # detik = 10 menit
 
 # ======= LOGGING =======
@@ -96,3 +96,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
