@@ -1,4 +1,4 @@
-playwright
 python-telegram-bot==20.8
 aiohttp
-asyncio
+requests
+playwright   # jika kamu akan pakai playwright fallback
