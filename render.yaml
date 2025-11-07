@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: cuttly-bot
+    env: python
+    buildCommand: |
+      pip install -r requirements.txt
+      playwright install --with-deps chromium
+    startCommand: python bot.py
