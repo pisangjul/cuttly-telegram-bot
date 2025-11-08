@@ -202,4 +202,4 @@ def main() -> None:
     app.add_handler(CommandHandler("total", total_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0, drop
+    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0, drop)
