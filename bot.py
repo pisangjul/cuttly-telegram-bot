@@ -200,7 +200,9 @@ def main():
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start_cmd))
-    ...
+    app.add_handler(CommandHandler("total", total_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     try:
         app.run_polling(
