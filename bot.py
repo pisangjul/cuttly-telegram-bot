@@ -1,60 +1,111 @@
 import os
-import requests
+import asyncio
+import logging
+from datetime import datetime
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
+# Logging untuk debugging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# Ambil token dari environment variable
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CUTTLY_API = os.getenv("CUTTLY_API_KEY")  # Tambahkan di Render dashboard > Environment > CUTTLY_API_KEY
+PORT = int(os.getenv("PORT", 8080))
 
+# Statistik global
+stats = {
+    "total_links": 0,
+    "batch_count": 0,
+    "errors": [],
+    "guard": [],
+    "start_time": None
+}
+
+# Command /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot aktif! Kirim link cutt.ly kamu untuk dicek statusnya.")
+    stats["start_time"] = datetime.now()
+    await update.message.reply_text(
+        "🤖 Bot aktif!\n"
+        "Kirim link cutt.ly kamu di sini.\n"
+        "Gunakan /stop untuk melihat hasil akhir."
+    )
 
+# Command /stop
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot berhenti.")
+    if not stats["start_time"]:
+        await update.message.reply_text("Bot belum dijalankan.")
+        return
 
-async def check_cuttly_link(link):
-    url = f"https://cutt.ly/api/api.php?key={CUTTLY_API}&short={link}"
-    response = requests.get(url)
-    data = response.json()
+    runtime = datetime.now() - stats["start_time"]
+    result_text = (
+        "📊 **REKAP BOT**\n\n"
+        f"🕒 Waktu berjalan: {runtime}\n"
+        f"🔗 Total link: {stats['total_links']}\n"
+        f"📦 Batch: {stats['batch_count']}\n"
+        f"⚠️ Error: {len(stats['errors'])}\n"
+        f"🛡️ Guard: {len(stats['guard'])}\n\n"
+        f"🔍 Detail Error:\n" +
+        "\n".join(stats["errors"][-5:] or ["-"]) +
+        "\n\n🧱 Guard Trigger:\n" +
+        "\n".join(stats["guard"][-5:] or ["-"])
+    )
+    await update.message.reply_text(result_text, parse_mode="Markdown")
+
+# Proses link
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    link = update.message.text.strip()
+
+    if not link.startswith("http"):
+        await update.message.reply_text("❌ Format link salah.")
+        stats["errors"].append(link)
+        return
 
     try:
-        status = data["url"]["status"]
-        if status == 7:
-            title = data["url"]["title"]
-            full_link = data["url"]["fullLink"]
-            return f"✅ Link aktif!\nJudul: {title}\nTujuan: {full_link}"
-        elif status == 1:
-            return "❌ Link tidak valid."
-        elif status == 2:
-            return "⚠️ Domain cutt.ly diblokir atau error."
-        elif status == 3:
-            return "⚠️ Link sudah dihapus atau rusak."
-        else:
-            return "❓ Tidak diketahui status link ini."
-    except Exception:
-        return "❌ Gagal memeriksa link."
+        # Simulasi batch process
+        stats["total_links"] += 1
+        if stats["total_links"] % 10 == 0:
+            stats["batch_count"] += 1
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if "cutt.ly" in text:
-        result = await check_cuttly_link(text)
-        await update.message.reply_text(result)
-    else:
-        await update.message.reply_text("Kirim link cutt.ly untuk saya periksa ya!")
+        # Guard (contoh: tolak domain tertentu)
+        if "guard" in link or "phish" in link:
+            stats["guard"].append(link)
+            await update.message.reply_text("🛑 Link diblokir oleh guard!")
+            return
 
-def main():
+        # Proses link dummy
+        await asyncio.sleep(0.5)
+        await update.message.reply_text(f"✅ Link diterima: {link}")
+
+    except Exception as e:
+        stats["errors"].append(str(e))
+        await update.message.reply_text("⚠️ Gagal memproses link.")
+
+# Main app
+async def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN belum diatur di environment.")
+        return
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-    print("🤖 Bot sedang berjalan...")
-    app.run_polling()
+    # Jalankan sebagai webhook (wajib di Render)
+    webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{webhook_url}/{BOT_TOKEN}"
+    )
 
 if __name__ == "__main__":
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 8443)),
-        url_path=BOT_TOKEN,
-        webhook_url=f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{BOT_TOKEN}"
-    )
+    asyncio.run(main())
