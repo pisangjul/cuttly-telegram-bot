@@ -194,17 +194,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # =========================
 def main() -> None:
     token = os.getenv("TELEGRAM_TOKEN")
+    logger.info(f"Token ditemukan? {bool(token)}")
     if not token:
         raise RuntimeError("Environment variable TELEGRAM_TOKEN tidak ditemukan.")
-    logger.info("Bot sedang berjalan (mode polling)…")
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("total", total_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.run_polling(
-    allowed_updates=Update.ALL_TYPES,
-    poll_interval=1.0,
-    drop_pending_updates=True,
-)
-
+    ...
