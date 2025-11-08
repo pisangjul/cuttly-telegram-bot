@@ -1,4 +1,4 @@
 python-telegram-bot==21.6
 playwright==1.55.0
-aiohttp
-asyncio
+aiohttp==3.13.2
+requests==2.32.5
