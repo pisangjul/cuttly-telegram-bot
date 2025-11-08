@@ -52,4 +52,9 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 8443)),
+        url_path=BOT_TOKEN,
+        webhook_url=f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{BOT_TOKEN}"
+    )
