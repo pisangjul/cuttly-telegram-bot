@@ -1,4 +1,4 @@
-python-telegram-bot==20.8
+python-telegram-bot==21.6
+playwright
 aiohttp
 requests
-playwright   # jika kamu akan pakai playwright fallback
