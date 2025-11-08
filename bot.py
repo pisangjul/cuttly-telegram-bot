@@ -2,9 +2,7 @@
 import os
 import asyncio
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")  # ambil token dari env
 CHAT_ID = os.environ.get("CHAT_ID")      # optional: simpan chat id juga di env
@@ -15,10 +13,8 @@ if not BOT_TOKEN:
 # contoh state sederhana
 waiting_for_links = {}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    waiting_for_links[chat_id] = True
-    await update.message.reply_text("📋 Kirim daftar link (satu baris per link). Ketik /stop untuk batal.")
+async def start(update, context):
+    await update.message.reply_text("Bot aktif!")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -48,11 +44,7 @@ async def receive_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_links))
-
-    print("🚀 Bot siap. Menjalankan polling...")
-    app.run_polling()  # blocking
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
