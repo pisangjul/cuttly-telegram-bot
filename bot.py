@@ -1,117 +1,260 @@
 import os
+import re
 import time
 import logging
 import asyncio
+from typing import List, Tuple, Optional
+
+import requests
+from urllib.parse import urlparse
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
-# ============= KONFIGURASI =============
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BATCH_SIZE = 30  # jumlah link per batch
-
-# ============= LOGGING =============
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-# ============= DATA GLOBAL =============
-links = []
-errors = []
-guards = []
-start_time = time.time()
-processing = False
+# =====================
+# Logging
+# =====================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("LinkBot")
 
-# ============= FUNGSI PENDUKUNG =============
-def runtime():
-    dur = int(time.time() - start_time)
-    jam = dur // 3600
-    menit = (dur % 3600) // 60
-    detik = dur % 60
-    return f"{jam:02d}:{menit:02d}:{detik:02d}"
+# =====================
+# Global State
+# =====================
+LINKS: List[str] = []    # Link valid (normal)
+ERRORS: List[str] = []   # Link bermasalah (gagal redirect / status >= 400 / timeout)
+GUARDS: List[str] = []   # Link mencurigakan (domain judi/slot/casino/bet)
+START_TIME: float = time.time()
+PAUSED: bool = False     # /stop → True (bot pause), /start → False (bot aktif)
 
-def batch_text():
-    total = len(links)
-    result = "\n".join(f"{i+1}. {link}" for i, link in enumerate(links))
-    summary = (
-        "\n\n📊 <b>RINGKASAN</b>\n"
-        f"Total link: {total}\n"
-        f"Total error: {len(errors)}\n"
-        f"Total guard: {len(guards)}\n"
-        f"Runtime: {runtime()}\n"
-    )
+# Regex sederhana untuk deteksi URL (termasuk cutt.ly atau lainnya)
+URL_REGEX = re.compile(
+    r"(?i)\b(?:https?://|www\.)[^\s<>()]+"
+)
 
-    if errors:
-        summary += "\n⚠️ <b>Daftar Error</b>\n" + "\n".join(errors)
-    if guards:
-        summary += "\n🛡️ <b>Daftar Guard</b>\n" + "\n".join(guards)
+SUSPICIOUS_KEYWORDS = ("judi", "slot", "casino", "bet")
 
-    return f"{result}{summary}"
 
-async def process_batch(context: ContextTypes.DEFAULT_TYPE, chat_id):
-    global links, processing
-    if not links:
-        await context.bot.send_message(chat_id=chat_id, text="❌ Tidak ada link untuk diproses.")
+# =====================
+# Util
+# =====================
+def now_runtime_str() -> str:
+    seconds = int(time.time() - START_TIME)
+    hrs = seconds // 3600
+    mins = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hrs}h {mins}m {secs}s"
+
+
+def is_suspicious_domain(url: str) -> bool:
+    try:
+        # Normalisasi jika diawali www.
+        if url.startswith("www."):
+            url = "http://" + url
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        text = host + " " + path
+        return any(k in text for k in SUSPICIOUS_KEYWORDS)
+    except Exception:
+        return False
+
+
+def check_redirect(url: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
+    """
+    Mengembalikan:
+    - ok (bool): True jika request berhasil (<400), False jika error/timeout
+    - final_url (str|None): URL akhir setelah redirect
+    - status_code (int|None): kode status HTTP
+    - reason (str|None): pesan singkat jika error
+    """
+    try:
+        # Tambahkan skema jika user hanya kirim "www.example.com"
+        if url.startswith("www."):
+            url = "http://" + url
+
+        resp = requests.get(url, allow_redirects=True, timeout=10)
+        status = resp.status_code
+        final_url = resp.url
+        if status >= 400:
+            return False, final_url, status, f"HTTP {status}"
+        return True, final_url, status, None
+    except requests.Timeout:
+        return False, None, None, "Timeout"
+    except requests.RequestException as e:
+        return False, None, None, f"Error: {e}"
+
+
+async def send_batched(update: Update, items: List[str], header: str) -> None:
+    """
+    Kirim list dalam batch 30 item per pesan, jeda 1.5 detik.
+    Format HTML, aman untuk jumlah besar.
+    """
+    if not items:
+        await update.message.reply_text(
+            f"{header}\n<i>Tidak ada data.</i>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    processing = True
-    await context.bot.send_message(chat_id=chat_id, text="🚀 Memproses batch...")
+    batch_size = 30
+    delay = 1.5
+    total = len(items)
+    for i in range(0, total, batch_size):
+        batch = items[i:i + batch_size]
+        body = "\n".join(f"{idx+1}. {val}" for idx, val in enumerate(batch, start=i))
+        text = f"{header}\n<pre>{body}</pre>"
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        if i + batch_size < total:
+            await asyncio.sleep(delay)
 
-    for i in range(0, len(links), BATCH_SIZE):
-        batch = links[i:i + BATCH_SIZE]
-        await asyncio.sleep(1.5)  # delay ringan antar batch
-        text_batch = "\n".join(batch)
-        await context.bot.send_message(chat_id=chat_id, text=f"📦 Batch {i//BATCH_SIZE + 1}\n{text_batch}")
 
-    await context.bot.send_message(chat_id=chat_id, text=batch_text(), parse_mode="HTML")
-    processing = False
-    links.clear()
-    errors.clear()
-    guards.clear()
+# =====================
+# Handlers
+# =====================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global PAUSED
+    PAUSED = False
+    await update.message.reply_text("Bot aktif", parse_mode=ParseMode.HTML)
 
-# ============= HANDLER =============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot aktif! Kirim link cutt.ly kamu di sini.\nKetik /total untuk melihat status.")
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⛔ Bot dihentikan sementara.")
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global PAUSED
+    PAUSED = True
+    await update.message.reply_text("Bot dihentikan sementara (pause).", parse_mode=ParseMode.HTML)
 
-async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        f"📊 Total link: {len(links)}\n"
-        f"⚠️ Error: {len(errors)} | 🛡️ Guard: {len(guards)}\n"
-        f"⏱ Runtime: {runtime()}\n"
+
+async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>Ringkasan</b>\n"
+        f"- Links: <b>{len(LINKS)}</b>\n"
+        f"- Errors: <b>{len(ERRORS)}</b>\n"
+        f"- Guards: <b>{len(GUARDS)}</b>\n"
+        f"- Runtime: <b>{now_runtime_str()}</b>\n"
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
 
-    if text.startswith("http"):
-        links.append(text)
-        await update.message.reply_text(f"✅ Link diterima! ({len(links)} total)")
-    elif text.lower().startswith("error"):
-        errors.append(text)
-        await update.message.reply_text("⚠️ Error dicatat.")
-    elif text.lower().startswith("guard"):
-        guards.append(text)
-        await update.message.reply_text("🛡️ Guard dicatat.")
-    elif text.lower() == "result":
-        await process_batch(context, update.effective_chat.id)
-    else:
-        await update.message.reply_text("💡 Gunakan format link atau ketik 'result' untuk ringkasan.")
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LINKS, ERRORS, GUARDS, PAUSED
 
-# ============= MAIN =============
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    msg = update.message.text.strip()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("total", total))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Perintah khusus via teks (tanpa /)
+    if msg.lower().startswith("error"):
+        ERRORS.append(msg)
+        await update.message.reply_text("Ditambahkan ke daftar errors.", parse_mode=ParseMode.HTML)
+        return
 
-    logging.info("Bot sedang berjalan (mode polling)...")
-    app.run_polling(drop_pending_updates=True)
+    if msg.lower().startswith("guard"):
+        GUARDS.append(msg)
+        await update.message.reply_text("Ditambahkan ke daftar guards.", parse_mode=ParseMode.HTML)
+        return
+
+    if msg.lower() == "result":
+        # Tampilkan daftar link + hasil pengecekan redirect-nya (ringkas)
+        # Kita generate ringkasan detail per link yang sudah ada (LINKS + GUARDS + ERRORS sumber link)
+        report_lines: List[str] = []
+        combined = []
+        # Gabungkan semua sumber link unik dari tiga daftar (yang berbentuk URL)
+        # Di sini kita ambil hanya yang terlihat seperti URL dari LINKS, ERRORS, GUARDS
+        def extract_urls(items: List[str]) -> List[str]:
+            urls = []
+            for it in items:
+                for m in URL_REGEX.findall(it):
+                    urls.append(m)
+            return urls
+
+        combined = list(dict.fromkeys(
+            extract_urls(LINKS) + extract_urls(ERRORS) + extract_urls(GUARDS)
+        ))
+
+        if not combined:
+            await update.message.reply_text(
+                "<b>Result</b>\n<i>Tidak ada link untuk diringkas.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        for url in combined:
+            ok, final_url, status, reason = check_redirect(url)
+            if ok:
+                suspicious = is_suspicious_domain(final_url or url)
+                tag = "GUARD" if suspicious else "OK"
+                final_show = final_url or url
+                report_lines.append(f"[{tag}] {url} → {final_show} (HTTP {status})")
+            else:
+                report_lines.append(f"[ERROR] {url} → {reason or 'Unknown error'}")
+
+        await send_batched(update, report_lines, "<b>Result (ringkasan redirect)</b>")
+        return
+
+    # Jika bot sedang pause, abaikan input biasa (tetap biarkan command bekerja)
+    if PAUSED:
+        await update.message.reply_text(
+            "Bot sedang pause. Gunakan /start untuk mengaktifkan kembali.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Deteksi link di pesan
+    urls = URL_REGEX.findall(msg)
+    if not urls:
+        # Tidak ada URL, abaikan
+        return
+
+    # Untuk setiap URL: cek redirect dan klasifikasikan
+    for url in urls:
+        ok, final_url, status, reason = check_redirect(url)
+        if not ok:
+            ERRORS.append(url)
+            logger.info(f"URL error: {url} ({reason})")
+            continue
+
+        # Cek domain mencurigakan pada URL akhir (atau URL awal jika None)
+        target = final_url or url
+        if is_suspicious_domain(target):
+            GUARDS.append(url)
+            logger.info(f"URL guard: {url} → {target} (HTTP {status})")
+        else:
+            LINKS.append(url)
+            logger.info(f"URL normal: {url} → {target} (HTTP {status})")
+
+
+# =====================
+# Main
+# =====================
+def main() -> None:
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Environment variable BOT_TOKEN tidak ditemukan.")
+
+    app = ApplicationBuilder().token(token).build()
+
+    # Command handlers
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("total", total_cmd))
+
+    # Text message handler (semua teks non-command)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    logger.info("Bot sedang berjalan (mode polling)…")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=1.0,
+        drop_pending_updates=True,
+    )
+
 
 if __name__ == "__main__":
     main()
