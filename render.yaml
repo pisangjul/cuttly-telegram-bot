@@ -1,11 +1,18 @@
 services:
   - type: worker
-    name: telegram-link-manager-bot
+    name: cuttly-bot
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    autoDeploy: true
     envVars:
-      - key: TELEGRAM_TOKEN
-        value: ""   # isi token BotFather di Render dashboard
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHECK_INTERVAL
+        value: "300"
+        sync: false
+      - key: CONCURRENCY
+        value: "10"
+        sync: false
+      - key: CACHE_TTL
+        value: "300"
+        sync: false
