@@ -266,40 +266,44 @@ def main():
 
     SEM = asyncio.Semaphore(CONCURRENCY)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("total", total))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # create global aiohttp session for reuse
+    # ======== definisi lifecycle aiohttp ========
     async def _init_session(app):
         global SESSION
         SESSION = aiohttp.ClientSession()
+        logging.info("Aiohttp session initialized.")
 
     async def _close_session(app):
         global SESSION
         if SESSION:
             await SESSION.close()
+            logging.info("Aiohttp session closed.")
 
-    # register session lifecycle
+    # ======== buat app hanya sekali ========
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(_init_session)
         .post_shutdown(_close_session)
         .build()
-        )
+    )
 
-    # schedule periodic job via JobQueue
-    # job callback signature uses ContextTypes.DEFAULT_TYPE
-    app.job_queue.run_repeating(periodic_check_job, interval=CHECK_INTERVAL, first=10)
+    # ======== tambahkan semua handler ========
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("total", total))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # ======== aktifkan JobQueue untuk periodic check ========
+    if app.job_queue:
+        app.job_queue.run_repeating(periodic_check_job, interval=CHECK_INTERVAL, first=10)
+    else:
+        logging.warning("JobQueue tidak tersedia — pastikan python-telegram-bot[job-queue] terinstal.")
 
     logging.info("Bot sedang berjalan (mode polling)...")
     app.run_polling(drop_pending_updates=True)
 
+
 if __name__ == "__main__":
     main()
+
 
