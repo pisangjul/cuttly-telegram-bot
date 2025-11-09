@@ -285,8 +285,13 @@ def main():
             await SESSION.close()
 
     # register session lifecycle
-    app.post_init(_init_session)
-    app.post_shutdown(_close_session)
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(_init_session)
+        .post_shutdown(_close_session)
+        .build()
+        )
 
     # schedule periodic job via JobQueue
     # job callback signature uses ContextTypes.DEFAULT_TYPE
@@ -297,3 +302,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
