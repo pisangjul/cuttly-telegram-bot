@@ -1,214 +1,299 @@
+# bot.py
 import os
-import re
 import time
-import logging
 import asyncio
-from typing import List, Dict, Any, Optional
-
-import cloudscraper
-from requests.exceptions import RequestException, Timeout
+import logging
+from typing import Dict, Any
+import aiohttp
+import async_timeout
 
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
 
-# =========================
-# Logging
-# =========================
+# ============= KONFIGURASI via ENV =============
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # detik, default 300 (5 menit)
+CONCURRENCY = int(os.getenv("CONCURRENCY", "10"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # detik
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "30"))
+BATCH_DELAY = float(os.getenv("BATCH_DELAY", "1.5"))
+
+# ============= LOGGING =============
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
-logger = logging.getLogger("LinkBot")
 
-# =========================
-# Global state
-# =========================
-LINKS: List[Dict[str, Any]] = []
-ERRORS: List[str] = []
-GUARDS: List[str] = []
-START_TIME: float = time.time()
-PAUSED: bool = False
+# ============= STATE GLOBAL =============
+links = []           # list of submitted links (raw)
+errors = []          # tempat log error manual dari user
+guards = []          # catatan guard manual dari user
+start_time = time.time()
+processing = False
 
-# Suspicious keywords
-SUSPICIOUS_KEYWORDS = ["judi", "slot", "casino", "bet"]
+subscribers = set()  # chat_id yang terdaftar untuk menerima hasil periodik
 
-# URL regex
-URL_PATTERN = re.compile(r"(?i)\bhttps?://[^\s<>\"']+")
+# cache: url -> (timestamp, result_dict)
+cache: Dict[str, Any] = {}
+cache_lock = asyncio.Lock()
 
-# Cloudscraper instance
-scraper = cloudscraper.create_scraper()
+# aiohttp session & semaphore (diinisialisasi di main)
+SESSION: aiohttp.ClientSession = None
+SEM: asyncio.Semaphore = None
 
-# =========================
-# Helpers
-# =========================
-def is_suspicious_domain(url: str) -> bool:
-    return any(k in (url or "").lower() for k in SUSPICIOUS_KEYWORDS)
+KEYWORDS_GUARD = ("judi", "slot", "casino", "bet", "porn", "gamble", "casinoindonesia")
 
-def format_runtime(seconds: float) -> str:
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+# ============= UTIL =============
+def runtime():
+    dur = int(time.time() - start_time)
+    jam = dur // 3600
+    menit = (dur % 3600) // 60
+    detik = dur % 60
+    return f"{jam:02d}:{menit:02d}:{detik:02d}"
 
-async def check_redirect(url: str) -> Dict[str, Any]:
-    def _do_request(u: str) -> Dict[str, Any]:
+def batch_text_from_results(results):
+    lines = []
+    for i, r in enumerate(results, 1):
+        url = r.get("url")
+        res = r.get("result")
+        note = r.get("note") or ""
+        loc = r.get("location") or ""
+        lines.append(f"{i}. {url}\n→ {res} {note} {loc}")
+    return "\n\n".join(lines)
+
+async def classify_url(url: str) -> dict:
+    """
+    Check URL briefly: HEAD (no follow) then fallback GET partial.
+    Return dict with keys: url, status, location, result, note, server
+    Uses global SESSION and SEM.
+    """
+    global SESSION, SEM
+    async with SEM:
+        now = time.time()
+        # cache check
+        async with cache_lock:
+            item = cache.get(url)
+            if item and now - item["ts"] < CACHE_TTL:
+                return item["result"]
+
         try:
-            resp = scraper.get(u, allow_redirects=True, timeout=10)
-            final_url = resp.url
-            status_code = resp.status_code
-            ok = status_code < 400
-            return {
-                "original": u,
-                "status_code": status_code,
-                "final_url": final_url,
-                "ok": ok,
-                "error": None,
-            }
-        except Timeout as e:
-            return {"original": u, "status_code": None, "final_url": None, "ok": False, "error": f"Timeout: {e}"}
-        except RequestException as e:
-            return {"original": u, "status_code": None, "final_url": None, "ok": False, "error": f"RequestException: {e}"}
+            async with async_timeout.timeout(12):
+                headers = {"User-Agent": "Mozilla/5.0 (compatible)"}
+                try:
+                    resp = await SESSION.head(url, allow_redirects=False, headers=headers)
+                except Exception:
+                    # fallback: GET partial
+                    headers["Range"] = "bytes=0-2048"
+                    resp = await SESSION.get(url, allow_redirects=False, headers=headers)
+
+                status = resp.status
+                loc = resp.headers.get("Location") or resp.headers.get("location")
+                server = (resp.headers.get("Server") or "").lower()
+                body_snip = ""
+
+                # read small body for detection if needed
+                if status == 200:
+                    try:
+                        body_snip = await resp.text()
+                        body_snip = body_snip[:2000].lower()
+                    except Exception:
+                        body_snip = ""
+
+                # classification logic
+                if status >= 500 or status in (403, 429):
+                    result = "error"
+                    note = f"status {status}"
+                elif 300 <= status < 400 and loc:
+                    low_loc = loc.lower()
+                    if any(k in low_loc for k in KEYWORDS_GUARD):
+                        result = "guard"
+                        note = f"redirect suspicious"
+                    else:
+                        result = "redirect"
+                        note = f"redirect"
+                elif "checking your browser" in body_snip or "cf-chl" in body_snip or "attention required" in body_snip:
+                    result = "cloudflare_challenge"
+                    note = "CF challenge"
+                elif status == 200:
+                    if any(k in body_snip for k in KEYWORDS_GUARD):
+                        result = "guard"
+                        note = "keyword in content"
+                    else:
+                        result = "ok"
+                        note = "200 OK"
+                else:
+                    result = "unknown"
+                    note = f"status {status}"
+
+                out = {"url": url, "status": status, "location": loc, "result": result, "note": note, "server": server}
+                # cache store
+                async with cache_lock:
+                    cache[url] = {"ts": time.time(), "result": out}
+                return out
+
+        except asyncio.TimeoutError:
+            out = {"url": url, "status": None, "location": None, "result": "error", "note": "timeout"}
+            async with cache_lock:
+                cache[url] = {"ts": time.time(), "result": out}
+            return out
         except Exception as e:
-            return {"original": u, "status_code": None, "final_url": None, "ok": False, "error": f"Exception: {e}"}
-    return await asyncio.to_thread(_do_request, url)
+            out = {"url": url, "status": None, "location": None, "result": "error", "note": f"exc: {e}"}
+            async with cache_lock:
+                cache[url] = {"ts": time.time(), "result": out}
+            return out
 
-def render_result_line(item: Dict[str, Any], tag: str) -> str:
-    original = item.get("original") or ""
-    status_code = item.get("status_code")
-    final_url = item.get("final_url") or ""
-    ok = item.get("ok")
-    error = item.get("error")
-
-    tag_label = f" <i>[{tag}]</i>"
-    if ok:
-        sc = status_code if status_code is not None else "-"
-        return f"<b>Link:</b> {original}{tag_label}\n  ↳ <b>Status:</b> {sc} | <b>Final:</b> {final_url}"
-    else:
-        sc = status_code if status_code is not None else "-"
-        err_text = error or "Unknown error"
-        return f"<b>Link:</b> {original}{tag_label}\n  ↳ <b>Status:</b> {sc} | <b>Error:</b> {err_text}"
-
-async def send_batched_lines(context: ContextTypes.DEFAULT_TYPE, chat_id: int, lines: List[str], header: Optional[str] = None) -> None:
-    if header:
-        await context.bot.send_message(chat_id=chat_id, text=header, parse_mode=ParseMode.HTML)
-    if not lines:
-        await context.bot.send_message(chat_id=chat_id, text="<i>Tidak ada data untuk ditampilkan.</i>", parse_mode=ParseMode.HTML)
+# ============= PERIODIC JOB =============
+async def periodic_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    JobQueue callback — runs every CHECK_INTERVAL seconds.
+    Will check all links currently in 'links' list and send results to subscribers.
+    """
+    if not links:
+        logging.info("Periodic check: no links to check.")
         return
-    BATCH_SIZE = 30
-    BATCH_DELAY_SEC = 1.5
-    for i in range(0, len(lines), BATCH_SIZE):
-        chunk = lines[i:i + BATCH_SIZE]
-        text = "\n".join(chunk)
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-        if i + BATCH_SIZE < len(lines):
-            await asyncio.sleep(BATCH_DELAY_SEC)
 
-# =========================
-# Auto-report job
-# =========================
-async def auto_report(context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = context.job.chat_id
-    runtime = format_runtime(time.time() - START_TIME)
-    lines: List[str] = []
-    for item in LINKS:
-        lines.append(render_result_line(item, "link"))
-    for e in ERRORS:
-        lines.append(f"<b>Error:</b> {e}")
-    for g in GUARDS:
-        lines.append(f"<b>Guard:</b> {g}")
-    header = (
-        f"<b>Auto Report:</b>\n"
-        f"- Links: {len(LINKS)}\n"
-        f"- Errors: {len(ERRORS)}\n"
-        f"- Guards: {len(GUARDS)}\n"
-        f"- Runtime: {runtime}\n"
+    current_links = list(set(links))  # unique
+    logging.info(f"Periodic check: checking {len(current_links)} links for {len(subscribers)} subscribers.")
+    # run checks concurrently with limit
+    tasks = [asyncio.create_task(classify_url(u)) for u in current_links]
+    results = await asyncio.gather(*tasks)
+
+    # split into guard/error/ok lists
+    guards_found = [r for r in results if r["result"] in ("guard", "cloudflare_challenge", "error")]
+    oks = [r for r in results if r["result"] == "ok"]
+    # prepare message per subscriber
+    summary_lines = []
+    summary_lines.append(f"⏱ Periodic Check — {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    summary_lines.append(f"Total checked: {len(results)}")
+    summary_lines.append(f"Found guard/error: {len(guards_found)} | OK: {len(oks)}")
+    summary = "\n".join(summary_lines)
+
+    bot = context.bot
+    # first send summary
+    for chat_id in subscribers:
+        try:
+            await bot.send_message(chat_id=chat_id, text=summary)
+        except Exception as e:
+            logging.warning(f"Failed send summary to {chat_id}: {e}")
+
+    # send detailed guard/error lists in batches
+    if guards_found:
+        for chat_id in subscribers:
+            try:
+                # prepare batched messages
+                for i in range(0, len(guards_found), BATCH_SIZE):
+                    batch = guards_found[i:i+BATCH_SIZE]
+                    text_batch = batch_text_from_results(batch)
+                    await bot.send_message(chat_id=chat_id, text=f"⚠️ Guard/Error batch {i//BATCH_SIZE + 1}\n\n{text_batch}", parse_mode="HTML")
+                    await asyncio.sleep(BATCH_DELAY)
+            except Exception as e:
+                logging.warning(f"Failed send detail to {chat_id}: {e}")
+
+    # Optionally send OK list if small
+    # (skip sending all OKs automatically if large — change as needed)
+    if len(oks) <= 20 and oks:
+        for chat_id in subscribers:
+            try:
+                await bot.send_message(chat_id=chat_id, text="✅ OK links:\n\n" + batch_text_from_results(oks), parse_mode="HTML")
+            except Exception as e:
+                logging.warning(f"Failed send oks to {chat_id}: {e}")
+
+# ============= HANDLER =============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    subscribers.add(chat_id)
+    await update.message.reply_text("🤖 Bot aktif! Kamu akan menerima hasil periodic check setiap beberapa menit. Kirim link cutt.ly di sini. Ketik /total untuk status.")
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in subscribers:
+        subscribers.remove(chat_id)
+    await update.message.reply_text("⛔ Kamu berhenti berlangganan hasil periodic check.")
+
+async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        f"📊 Total link stored: {len(links)}\n"
+        f"⚠️ Errors manual: {len(errors)} | 🛡️ Guards manual: {len(guards)}\n"
+        f"Subscribed chats: {len(subscribers)}\n"
+        f"⏱ Runtime: {runtime()}\n"
     )
-    await send_batched_lines(context, chat_id, lines, header=header)
-    logger.info("Auto-report dikirim.")
+    await update.message.reply_text(msg)
 
-# =========================
-# Handlers
-# =========================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global PAUSED
-    PAUSED = False
-    await update.message.reply_text("Bot aktif")
-    # Schedule auto-report setiap 5 menit
-    context.job_queue.run_repeating(auto_report, interval=300, first=10, chat_id=update.effective_chat.id)
-    logger.info("Perintah /start diterima. Auto-report dijadwalkan.")
-
-async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    runtime = format_runtime(time.time() - START_TIME)
-    text = (
-        f"<b>Total ringkasan:</b>\n"
-        f"- Links: {len(LINKS)}\n"
-        f"- Errors: {len(ERRORS)}\n"
-        f"- Guards: {len(GUARDS)}\n"
-        f"- Runtime: {runtime}\n"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global PAUSED
-    PAUSED = True
-    await update.message.reply_text("Bot dihentikan sementara. Polling tetap berjalan.", parse_mode=ParseMode.HTML)
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    lower = text.lower()
-    if PAUSED:
-        await update.message.reply_text("<i>Bot sedang dihentikan sementara. Gunakan /start untuk melanjutkan.</i>", parse_mode=ParseMode.HTML)
-        return
-    urls = URL_PATTERN.findall(text)
-    if urls:
-        lines: List[str] = []
-        for url in urls:
-            result = await check_redirect(url)
-            if not result.get("ok", False):
-                ERRORS.append(url)
-                lines.append(render_result_line(result, "error"))
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Error pada link: {url}", parse_mode=ParseMode.HTML)
-            elif is_suspicious_domain(result.get("final_url") or url):
-                GUARDS.append(url)
-                lines.append(render_result_line(result, "guard"))
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🚨 Guard terdeteksi: {url}", parse_mode=ParseMode.HTML)
-            else:
-                LINKS.append(result)
-                lines.append(render_result_line(result, "link"))
-        await send_batched_lines(context, update.effective_chat.id, lines, header="<b>Hasil pengecekan redirect:</b>")
+    if text.startswith("http"):
+        links.append(text)
+        await update.message.reply_text(f"✅ Link diterima! ({len(links)} total). Akan dicek pada interval berikutnya.")
+    elif text.lower().startswith("error"):
+        errors.append(text)
+        await update.message.reply_text("⚠️ Error dicatat.")
+    elif text.lower().startswith("guard"):
+        guards.append(text)
+        await update.message.reply_text("🛡️ Guard dicatat.")
+    elif text.lower() == "result":
+        # immediate check for this chat only
+        chat_id = update.effective_chat.id
+        await update.message.reply_text("🔎 Menjalankan pengecekan cepat untuk link yang ada...")
+        current_links = list(set(links))
+        tasks = [asyncio.create_task(classify_url(u)) for u in current_links]
+        results = await asyncio.gather(*tasks)
+        guards_found = [r for r in results if r["result"] in ("guard", "cloudflare_challenge", "error")]
+        oks = [r for r in results if r["result"] == "ok"]
+
+        # send summary + details
+        summary = f"Quick check: Total {len(results)}, guard/error {len(guards_found)}, ok {len(oks)}"
+        await context.bot.send_message(chat_id=chat_id, text=summary)
+        if guards_found:
+            for i in range(0, len(guards_found), BATCH_SIZE):
+                batch = guards_found[i:i+BATCH_SIZE]
+                await context.bot.send_message(chat_id=chat_id, text=batch_text_from_results(batch), parse_mode="HTML")
+                await asyncio.sleep(BATCH_DELAY)
     else:
-        await update.message.reply_text("<i>Kirim link untuk diperiksa.</i>", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("💡 Kirim link (http...) atau ketik 'result' untuk pengecekan cepat.")
 
-# =========================
-# Main
-# =========================
+# ============= MAIN =============
 def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    logger.info(f"Token terbaca: {token}")
-    if not token:
-        raise RuntimeError("TELEGRAM_TOKEN tidak ditemukan")
+    global SESSION, SEM
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN tidak ditemukan di environment.")
+        return
 
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("total", total_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    SEM = asyncio.Semaphore(CONCURRENCY)
 
-    try:
-        app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            poll_interval=1.0,
-            drop_pending_updates=True,
-        )
-    except Exception as e:
-        logger.exception(f"Bot gagal dijalankan: {e}")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("total", total))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # create global aiohttp session for reuse
+    async def _init_session(app):
+        global SESSION
+        SESSION = aiohttp.ClientSession()
+
+    async def _close_session(app):
+        global SESSION
+        if SESSION:
+            await SESSION.close()
+
+    # register session lifecycle
+    app.post_init(_init_session)
+    app.post_shutdown(_close_session)
+
+    # schedule periodic job via JobQueue
+    # job callback signature uses ContextTypes.DEFAULT_TYPE
+    app.job_queue.run_repeating(periodic_check_job, interval=CHECK_INTERVAL, first=10)
+
+    logging.info("Bot sedang berjalan (mode polling)...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
