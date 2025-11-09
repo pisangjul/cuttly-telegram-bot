@@ -208,7 +208,10 @@ async def periodic_check_job(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     subscribers.add(chat_id)
-    await update.message.reply_text("🤖 Bot aktif! Kamu akan menerima hasil periodic check setiap beberapa menit. Kirim link cutt.ly di sini. Ketik /total untuk status.")
+    await update.message.reply_text(
+        "🤖 Bot aktif! Kamu akan menerima hasil periodic check setiap beberapa menit.\n"
+        "Kirim link cutt.ly di sini (boleh banyak baris sekaligus). Ketik /total untuk status."
+    )
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -225,28 +228,50 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
+# ✅ Tambahan baru: hapus semua link
+async def delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = len(links)
+    links.clear()
+    await update.message.reply_text(f"🗑️ {count} link telah dihapus dari daftar.")
+
+# ✅ Revisi: agar bot bisa baca banyak link sekaligus per baris
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if text.startswith("http"):
-        links.append(text)
-        await update.message.reply_text(f"✅ Link diterima! ({len(links)} total). Akan dicek pada interval berikutnya.")
-    elif text.lower().startswith("error"):
+    chat_id = update.effective_chat.id
+
+    # deteksi kalau kiriman berisi banyak URL
+    urls = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("http://") or line.startswith("https://"):
+            urls.append(line)
+
+    # Jika ada link yang valid, simpan semuanya
+    if urls:
+        links.extend(urls)
+        await update.message.reply_text(
+            f"✅ {len(urls)} link diterima ({len(links)} total tersimpan). Akan dicek pada interval berikutnya."
+        )
+        return
+
+    # Catatan manual: error / guard
+    if text.lower().startswith("error"):
         errors.append(text)
         await update.message.reply_text("⚠️ Error dicatat.")
     elif text.lower().startswith("guard"):
         guards.append(text)
         await update.message.reply_text("🛡️ Guard dicatat.")
+
+    # Pengecekan cepat manual
     elif text.lower() == "result":
-        # immediate check for this chat only
-        chat_id = update.effective_chat.id
         await update.message.reply_text("🔎 Menjalankan pengecekan cepat untuk link yang ada...")
         current_links = list(set(links))
         tasks = [asyncio.create_task(classify_url(u)) for u in current_links]
         results = await asyncio.gather(*tasks)
+
         guards_found = [r for r in results if r["result"] in ("guard", "cloudflare_challenge", "error")]
         oks = [r for r in results if r["result"] == "ok"]
 
-        # send summary + details
         summary = f"Quick check: Total {len(results)}, guard/error {len(guards_found)}, ok {len(oks)}"
         await context.bot.send_message(chat_id=chat_id, text=summary)
         if guards_found:
@@ -266,7 +291,6 @@ def main():
 
     SEM = asyncio.Semaphore(CONCURRENCY)
 
-    # ======== definisi lifecycle aiohttp ========
     async def _init_session(app):
         global SESSION
         SESSION = aiohttp.ClientSession()
@@ -278,7 +302,6 @@ def main():
             await SESSION.close()
             logging.info("Aiohttp session closed.")
 
-    # ======== buat app hanya sekali ========
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -287,23 +310,15 @@ def main():
         .build()
     )
 
-    # ======== tambahkan semua handler ========
+    # tambahkan handler baru /delete
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("total", total))
+    app.add_handler(CommandHandler("delete", delete_links))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # ======== aktifkan JobQueue untuk periodic check ========
     if app.job_queue:
         app.job_queue.run_repeating(periodic_check_job, interval=CHECK_INTERVAL, first=10)
-    else:
-        logging.warning("JobQueue tidak tersedia — pastikan python-telegram-bot[job-queue] terinstal.")
 
     logging.info("Bot sedang berjalan (mode polling)...")
     app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
-
-
